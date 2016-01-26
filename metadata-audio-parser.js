@@ -22,7 +22,7 @@
  * Extended to support year, genre, rating, play counting, returns picture as blob, added several new mp4 tags, removed thumbnail generation, proper cyrillic text suppor
  *
  * @ 2016, OpenA { https://github.com/OpenA/metadata-audio-parser }
- * Add support track comments ; Full Ogg metadata support (with CoverArt return as blob format) ; Improove support ID3v1/1.1 ; Extend file name parser abilities
+ * Add support track comments ; Full Ogg metadata support (with CoverArt return as blob format) ; FLAC support ; Improove support ID3v1/1.1 ; Extend file name parser abilities
  */
 'use strict';
 
@@ -125,7 +125,20 @@ function parse_audio_metadata (blob, metadataCallback, errorCallback) {
 		'covr'    : IMAGE,
 		'Year'    : YEAR
 	};
-
+	
+	// Map ogg, flac, opus tagnames to metadata property names
+	var VORBIS_COMMENTS = {
+		DATE        : YEAR,
+		TITLE       : TITLE,
+		ARTIST      : ARTIST,
+		ALBUM       : ALBUM,
+		TRACKNUMBER : TRACKNUM,
+		COMMENTS    : COMMENT,
+		COMMENT     : COMMENT,
+		GENRE       : GENRE,
+		METADATA_BLOCK_PICTURE: IMAGE
+	};
+	
 	// These are 'ftyp' values that we recognize
 	// See http://www.mp4ra.org/filetype.html
 	// Also see gecko code in /toolkit/components/mediasniffer/nsMediaSniffer.cpp
@@ -178,6 +191,9 @@ function parse_audio_metadata (blob, metadataCallback, errorCallback) {
 			} else if (magic.substring(0, 4) === 'OggS') {
 				// parse metadata from an Ogg Vorbis file
 				parseOggMetadata(header);
+			} else if (magic.substring(0, 4) === 'fLaC') {
+				// parse metadata from an Ogg Vorbis file
+				parseFLACMetadata(header);
 			} else if (magic.substring(4, 8) === 'ftyp') {
 				// This is an MP4 file
 				if (checkMP4Type(header, MP4Types)) {
@@ -464,18 +480,6 @@ function parse_audio_metadata (blob, metadataCallback, errorCallback) {
 	//
 	function parseOggMetadata (header) {
 		
-		// Map ogg tagnames to metadata property names
-		var OGGTAGS = {
-			DATE        : YEAR,
-			TITLE       : TITLE,
-			ARTIST      : ARTIST,
-			ALBUM       : ALBUM,
-			TRACKNUMBER : TRACKNUM,
-			COMMENTS    : COMMENT,
-			GENRE       : GENRE,
-			METADATA_BLOCK_PICTURE: IMAGE
-		};
-		
 		// Look for a comment packet from a supported codec
 		switch (header.getASCIIText(28, 4)) {
 			case 'Opus':                           // Opus
@@ -555,13 +559,13 @@ function parse_audio_metadata (blob, metadataCallback, errorCallback) {
 						
 						if (Comments.length > seenRange) {
 							// multiple pages metadata comment, load part from last segment and break to the next page
-							Comments.string += page.getASCIIText(byteOffset, seenRange);
+							Comments.string += page.getUTF8Text(byteOffset, seenRange);
 							Comments.length -= seenRange;
 							break;
 						} else {
 							Comments.string += page.getUTF8Text(byteOffset, Comments.length);
 							var values  = Comments.string.split('='),
-								ogg_tag = OGGTAGS[values[0].toUpperCase()];
+								ogg_tag = VORBIS_COMMENTS[values[0].toUpperCase()];
 								
 							if (ogg_tag && values[1]) {
 								metadata[ogg_tag] = values[1];
@@ -590,6 +594,142 @@ function parse_audio_metadata (blob, metadataCallback, errorCallback) {
 			}
 		})
 	}
+	
+	function parseFLACMetadata(header) {
+		// First four bytes are "fLaC" or we wouldn't be here.
+		header.seek(4);
+		
+		var has_vorbis_comment = false;
+		var has_picture = false;
+		
+		findMetadataBlocks(header);
+		
+		function processBlock(block) {
+			switch (block.block_type) {
+				case 4:
+					readAllComments(block.view);
+					has_vorbis_comment = true;
+					break;
+				case 6:
+					metadata['picture'] = new Blob([block.view.buffer]);
+					has_picture = true;
+			}
+			return (!has_vorbis_comment || !has_picture);
+		}
+		
+		/**
+		* Step over metadata blocks until we find the proper metadata block.
+		*
+		* @param {BlobView} blobview The BlobView for the file.
+		* @param {function} callback The callback to process the block with.
+		* @return {Promise} A Promise that resolves when all relevant metadata blocks
+		*   have been processed.
+		*/
+		function findMetadataBlocks(blobview) {
+			return readMetadataBlockHeader(blobview).then((block) => {
+				if (processBlock(block) && !block.last) {
+					block.view.advance(block.length - block.view.index);
+					findMetadataBlocks(block.view);
+				} else {
+					if (metadata[IMAGE]) {
+						MDPBlockParser(metadata[IMAGE]);
+					} else {
+						metadataCallback(metadata);
+					}
+				}
+			});
+		}
+
+		/**
+		* Read a metadata block header and fetch its contents from the Blob, plus
+		* enough extra data to read the next block's header.
+		*
+		* @param {BlobView} blobview The BlobView for the file.
+		* @return {Promise} A Promise resolving to an object with the following
+		*   fields:
+		*     {Boolean} last True if this is the last metadata block.
+		*     {Number} block_type The block's type, as an integer.
+		*     {Number} length The size in bytes of the block's body (excluding the
+		*       header).
+		*     {BlobView} view The BlobView with the block's data, starting at the
+		*       beginning of the metadata block's content (not the header).
+		*/
+		function readMetadataBlockHeader(blobview) {
+			return new Promise(function(resolve, reject) {
+				var header = blobview.readUnsignedByte();
+				var last = (header & 0x80) === 0x80;
+				var block_type = header & 0x7F;
+				var length = blobview.readUint24(false);
+				
+				// Get the contents of this block, plus enough to read the next block's
+				// header if necessary.
+				blobview.getMore(blobview.viewOffset + blobview.index, length + 4, function(more, err) {
+					if (err) {
+						reject(err);
+						return;
+					}
+					
+					resolve({
+						last: last,
+						block_type: block_type,
+						length: length,
+						view: more
+					});
+				});
+			});
+		}
+
+		/**
+		* Read all the comments in a metadata header block.
+		*
+		* @param {BlobView} page The audio file being parsed.
+		* @param {Metadata} metadata The (partially filled-in) metadata object.
+		*/
+		function readAllComments(page) {
+			// skip vendor string
+			var vendor_string_length = page.readUnsignedInt(true);
+				page.advance(vendor_string_length);
+			
+			var num_comments = page.readUnsignedInt(true);
+			for (var i = 0; i < num_comments; i++) {
+				try {
+					var comment = readComment(page);
+					if (comment) {
+						metadata[comment.field] = comment.value;
+					}
+				} catch (e) {
+					console.warn('Error parsing vorbis comment', e);
+				}
+			}
+		}
+
+		/*
+		* Read a single comment field.
+		*
+		* @param {BlobView} page The audio file being parsed.
+		*/
+		function readComment(page) {
+			var comment_length = page.readUnsignedInt(true);
+			var comment = page.readUTF8Text(comment_length);
+			var equal = comment.indexOf('=');
+			if (equal === -1) {
+				throw new Error('missing delimiter in comment');
+			}
+			
+			var fieldname = comment.substring(0, equal).toUpperCase().replace(' ', '');
+			var propname = VORBIS_COMMENTS[fieldname];
+			if (propname) { // Do we care about this field?
+				var value = comment.substring(equal + 1);
+				return {
+					field: propname,
+					value: value
+				};
+			}
+			return null;
+		}
+	}
+
+
 
 	// MP4 files use 'ftyp' to identify the type of encoding.
 	// 'ftyp' information
@@ -944,7 +1084,7 @@ function parse_audio_metadata (blob, metadataCallback, errorCallback) {
 				return;
 			}
 		
-			var mimeL, mime_type, descL, imageL, Props = {};
+			var mimeL, mime, descL, imageL, image, Props = {};
 			// ID3v2_APIC = { 0: Other, 1: 32x32 pixels 'file icon' (PNG only), 2: Other file icon, 3: Cover (front), 4: Cover (back), 5: Leaflet page,
 			// 6: Media (e.g. label side of CD), 7: Lead artist/lead performer/soloist, 8: Artist/performer, 9: Conductor, 10: Band/Orchestra,
 			// 11: Composer, 12: Lyricist/text writer, 13: Recording Location, 14: During recording, 15: During performance,
@@ -952,7 +1092,7 @@ function parse_audio_metadata (blob, metadataCallback, errorCallback) {
 			Props.APIC   = page.readUnsignedInt()
 		
 			mimeL        = page.readUnsignedInt()    // MIME Type section size - [image/png 0x09, image/jpeg 0x12]
-			mime_type    = page.readASCIIText(mimeL) // MIME Type section
+			mime         = page.readASCIIText(mimeL) // MIME Type section
 		
 			descL        = page.readUnsignedInt()    // Description section size
 			Props.name   = page.readASCIIText(descL) // Description section (it's somthing like comment)
@@ -961,8 +1101,9 @@ function parse_audio_metadata (blob, metadataCallback, errorCallback) {
 			Props.depth  = page.readUnsignedInt()    // image color depth [8, 16, 24, 32]
 			Props.index  = page.readUnsignedInt()    // maybe color profile, i dont know
 			imageL       = page.readUnsignedInt()    // image section size
+			image        = page.readUnsignedByteArray(imageL) // image section
 		
-			metadata[IMAGE] = mbp_blob.slice(page.sliceOffset + page.viewOffset + page.index, imageL, mime_type)
+			metadata[IMAGE] = new Blob([image], {type: mime});
 		
 			for (var key in Props) {
 				metadata[IMAGE][key] = Props[key]
