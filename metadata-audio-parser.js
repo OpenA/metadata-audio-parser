@@ -60,7 +60,7 @@ function parse_audio_metadata (blob, metadataCallback, errorCallback) {
 	// otherwise it should be an audio blob that probably from network/process
 	// we can still parse it but we don't need to care about the filename
 	if (blob.name) {
-		// Trying to get some info's (title, tracknumber and comment) from file name
+		// Trying to get some info's (title and tracknumber) from file name
 		// If file metadata is empty or partially filled, output data will include this (or partially this)
 		var file_ext = (blob.name.match(/[^\.]+$/) || ['*'])[0],
 			fn_start =  blob.name.lastIndexOf('/'),
@@ -68,8 +68,7 @@ function parse_audio_metadata (blob, metadataCallback, errorCallback) {
 			filepath =  blob.name.substring(0, fn_start),
 			filename =  blob.name.substring(fn_start + 1, fn_end);
 			
-		metadata[TITLE]    = filename.replace(/\_/g, ' ').replace(/^\d*(?:\s-|\.)?\s/, '').replace(/\s(?:\[|\(|\{).+(?:\)|\]|\})/, '');
-		metadata[COMMENT]  = (filename.match(/(?:\[|\(|\{).+(?:\)|\]|\})/) || [''])[0];
+		metadata[TITLE]    = filename.replace(/\_/g, ' ').replace(/^\d*(?:\s-|\.)?\s/, '');
 		metadata[TRACKNUM] = Number((filename.match(/^\d*/) || [0])[0]);
 		
 		switch (file_ext) {
@@ -192,7 +191,7 @@ function parse_audio_metadata (blob, metadataCallback, errorCallback) {
 				// parse metadata from an Ogg Vorbis file
 				parseOggMetadata(header);
 			} else if (magic.substring(0, 4) === 'fLaC') {
-				// parse metadata from an Ogg Vorbis file
+				// parse metadata from an FLAC file
 				parseFLACMetadata(header);
 			} else if (magic.substring(4, 8) === 'ftyp') {
 				// This is an MP4 file
@@ -470,100 +469,81 @@ function parse_audio_metadata (blob, metadataCallback, errorCallback) {
 		}
 	}
 	
-	//
-	// Format information:
-	//   http://en.wikipedia.org/wiki/Ogg
-	//   http://xiph.org/vorbis/doc/Vorbis_I_spec.html
-	//   http://www.xiph.org/vorbis/doc/v-comment.html
-	//   http://wiki.xiph.org/VorbisComment
-	//   http://tools.ietf.org/html/draft-ietf-codec-oggopus-00
-	//
-	function parseOggMetadata (header) {
+	/*
+	* Format information:
+	*   http://en.wikipedia.org/wiki/Ogg
+	*   http://www.xiph.org/vorbis/doc/v-comment.html
+	*   http://wiki.xiph.org/VorbisComment
+	*   https://www.xiph.org/ogg/doc/rfc3533.txt
+	*   https://www.xiph.org/ogg/doc/rfc5334.txt
+	*   http://www.digitalpreservation.gov/formats/fdd/fdd000026.shtml
+	*/
+	function parseOggMetadata (view) {
 		
-		// Look for a comment packet from a supported codec
-		switch (header.getASCIIText(28, 4)) {
-			case 'Opus':                           // Opus
-			case '\x7FFLA':                        // FLAC
-			case '\x01vor':                        // Vorbis
-				break;
-			default:
-				return errorCallback('malformed ogg comment packet');
-		}
-		
-		// Ogg metadata is in the second header packet.  We need to read
-		// the first packet to find the start of the second.
-		function parseOggHeader(page, offset) {
-			var num_segments    = page.getUint8(26 + offset),
-				segment_lengths = page.getUnsignedByteArray(27 + offset, num_segments),
-				head_length     = Array.reduce(segment_lengths, sum, 0);
-			return {
-				numberSegments: num_segments,
-				segmentLengths: segment_lengths,
-				sectionLength : 27 + offset + num_segments + head_length,
-				offsetLength  : 27 + offset + num_segments,
-				length        : head_length
-			} 
-		}
-		
-		function sum (x, y) {
-			return x + y;
-		} // for Array.reduce() below
-		
-		BlobView.get(blob, 0, blob.size, function (page, error) {
-			if (error) {
-				errorCallback(error);
-				return;
-			}
-			
-			var Comments = {
+		var OggS = 0,
+			CodecOffset = 0,
+			Comments = {
 				string: '',
 				length: 0,
 				total : 0
-			}, OggS = {
-				0: parseOggHeader(header, 0)
-			}, P = 0;
+			}
+		
+		function readOggPages(page) {
+			// skip first 26 Bytes (magic number, version, granule position, checksum, etc)
+			page.advance(26);
 			
-			while (OggS[P]) {
-				P++;
-				try {
-						OggS[P]    = parseOggHeader(page, OggS[P - 1].sectionLength);
-					var byteOffset = OggS[P].offsetLength;
-					
-					if (P === 1) {
-						// codec packet break
-						var first_byte = page.getInt8(byteOffset);
-							byteOffset += 4;
-						switch (first_byte) {
-							case 79: byteOffset += 1;
-							case 3 : byteOffset += 3;
-						}
-						
-						// vendor string break
-						var vendor_string_length = page.getUint32(byteOffset, true);
-							byteOffset += 4 + vendor_string_length;
-						
-						// tagnames length field ( 4-byte ).
-						Comments.total = page.getInt8(byteOffset);
-							byteOffset += 4;
+			// number of segment entries encoded in the segment table
+			var page_segments = page.readUnsignedByte(),
+			// containing the lacing values of all segments in this page
+				segment_table = page.readUnsignedByteArray(page_segments),
+			// total header size in Bytes 
+				header_size   = page_segments + 27,
+			// total page size in Bytes
+				page_size     = Array.reduce(segment_table, sum, 0);
+			
+			switch ( OggS++ ) {
+				case 0:
+					switch (page.getASCIIText(page.index, 4)) {
+						case 'Opus':                           // Opus
+							CodecOffset += 1;
+						case '\x01vor':                        // Vorbis
+							CodecOffset += 3;
+						case '\x7FFLA':                        // FLAC
+							CodecOffset += 4;
 					}
+					page.advance(page_size);
+					readOggPages(page);
+					break;
+				case 1:
+					// skip codec packet
+					page.advance(CodecOffset);
+					page_size -= CodecOffset;
 					
+					// skip vendor string ( unsigned integer of 32 bits ).
+					var vendor_string_length = page.readUnsignedInt(true);
+						page_size -= vendor_string_length + 4;
+						page.advance(vendor_string_length);
+					
+					// tagnames length field ( unsigned integer of 32 bits ).
+					Comments.total = page.readUnsignedInt(true);
+					page_size -= 4;
+				default:
 					for (; Comments.total > 0; Comments.total--) {
 						
 						if (Comments.length === 0) {
 							// comment string count ( 4-byte ).
-							Comments.length = page.getUint32(byteOffset, true);
-								byteOffset += 4
+							Comments.length = page.readUnsignedInt(true);
+							page_size -= 4;
 						}
 						
-						var seenRange = OggS[P].sectionLength - byteOffset
-						
-						if (Comments.length > seenRange) {
-							// multiple pages metadata comment, load part from last segment and break to the next page
-							Comments.string += page.getUTF8Text(byteOffset, seenRange);
-							Comments.length -= seenRange;
+						if (Comments.length > page_size) {
+							// multiple pages metadata comment, load part from last segment and go to the next page
+							Comments.string += page.readUTF8Text(page_size);
+							Comments.length -= page_size;
 							break;
 						} else {
-							Comments.string += page.getUTF8Text(byteOffset, Comments.length);
+							Comments.string += page.readUTF8Text(Comments.length);
+							
 							var values  = Comments.string.split('='),
 								ogg_tag = VORBIS_COMMENTS[values[0].toUpperCase()];
 								
@@ -571,165 +551,104 @@ function parse_audio_metadata (blob, metadataCallback, errorCallback) {
 								metadata[ogg_tag] = values[1];
 							}
 							
-							byteOffset     += Comments.length;
+							page_size -= Comments.length;
 							Comments.length = 0 ;
 							Comments.string = '';
 						}
 					}
-					
-					if (!Comments.total)
-						break;
-						
-				} catch(e) {
-					console.warn(e);
-					break;
-				}
+					if (!Comments.total) {
+						if (metadata[IMAGE]) {
+							var arr_data_mdp = base64DecToArr(metadata[IMAGE]),
+								blob_mdp     = new Blob([arr_data_mdp]);
+							BlobView.get(blob_mdp, 0, blob_mdp.size, function (pic, err) {
+								if (err) {
+									errorCallback(err);
+									delete metadata[IMAGE];
+								} else {
+									metadata[IMAGE] = MDPBlockReader(pic);
+								}
+								metadataCallback(metadata);
+							});
+						} else {
+							metadataCallback(metadata);
+						}
+					} else {
+						readOggPages(page);
+					}
 			}
-			if (metadata[IMAGE]) {
-				var arr_data_mdp = base64DecToArr(metadata[IMAGE]),
-					blob_mdp     = new Blob([arr_data_mdp]);
-				MDPBlockParser(blob_mdp);
-			} else {
-				metadataCallback(metadata);
-			}
+		}
+		
+		BlobView.get(blob, 0, blob.size, function (page, error) {
+			readOggPages(page);
 		})
+		
+		function sum (x, y) {
+			return x + y;
+		} // for Array.reduce() below
 	}
 	
-	function parseFLACMetadata(header) {
+	function parseFLACMetadata(view) {
 		// First four bytes are "fLaC" or we wouldn't be here.
-		header.seek(4);
+		view.seek(4);
 		
-		var has_vorbis_comment = false;
-		var has_picture = false;
+		var Has = {
+			VORBIS_COMMENT: false,
+			PICTURE: false
+		};
 		
-		findMetadataBlocks(header);
+		readFLACPages(view);
 		
-		function processBlock(block) {
-			switch (block.block_type) {
-				case 4:
-					readAllComments(block.view);
-					has_vorbis_comment = true;
-					break;
-				case 6:
-					metadata['picture'] = new Blob([block.view.buffer]);
-					has_picture = true;
-			}
-			return (!has_vorbis_comment || !has_picture);
-		}
-		
-		/**
-		* Step over metadata blocks until we find the proper metadata block.
-		*
-		* @param {BlobView} blobview The BlobView for the file.
-		* @param {function} callback The callback to process the block with.
-		* @return {Promise} A Promise that resolves when all relevant metadata blocks
-		*   have been processed.
-		*/
-		function findMetadataBlocks(blobview) {
-			return readMetadataBlockHeader(blobview).then((block) => {
-				if (processBlock(block) && !block.last) {
-					block.view.advance(block.length - block.view.index);
-					findMetadataBlocks(block.view);
-				} else {
-					if (metadata[IMAGE]) {
-						MDPBlockParser(metadata[IMAGE]);
-					} else {
-						metadataCallback(metadata);
-					}
-				}
-			});
-		}
-
-		/**
-		* Read a metadata block header and fetch its contents from the Blob, plus
-		* enough extra data to read the next block's header.
-		*
-		* @param {BlobView} blobview The BlobView for the file.
-		* @return {Promise} A Promise resolving to an object with the following
-		*   fields:
-		*     {Boolean} last True if this is the last metadata block.
-		*     {Number} block_type The block's type, as an integer.
-		*     {Number} length The size in bytes of the block's body (excluding the
-		*       header).
-		*     {BlobView} view The BlobView with the block's data, starting at the
-		*       beginning of the metadata block's content (not the header).
-		*/
-		function readMetadataBlockHeader(blobview) {
-			return new Promise(function(resolve, reject) {
-				var header = blobview.readUnsignedByte();
-				var last = (header & 0x80) === 0x80;
-				var block_type = header & 0x7F;
-				var length = blobview.readUint24(false);
+		function readFLACPages(page) {
+			// Read a metadata block header and fetch its contents from the Blob, plus
+			// enough extra data to read the next block's header
+			var header = page.readUnsignedByte(),
+				last   = (header & 0x80) === 0x80,
+				type   =  header & 0x7F,
+				length = page.readUint24(false);
 				
-				// Get the contents of this block, plus enough to read the next block's
-				// header if necessary.
-				blobview.getMore(blobview.viewOffset + blobview.index, length + 4, function(more, err) {
-					if (err) {
-						reject(err);
-						return;
-					}
-					
-					resolve({
-						last: last,
-						block_type: block_type,
-						length: length,
-						view: more
-					});
-				});
-			});
-		}
-
-		/**
-		* Read all the comments in a metadata header block.
-		*
-		* @param {BlobView} page The audio file being parsed.
-		* @param {Metadata} metadata The (partially filled-in) metadata object.
-		*/
-		function readAllComments(page) {
-			// skip vendor string
-			var vendor_string_length = page.readUnsignedInt(true);
-				page.advance(vendor_string_length);
-			
-			var num_comments = page.readUnsignedInt(true);
-			for (var i = 0; i < num_comments; i++) {
-				try {
-					var comment = readComment(page);
-					if (comment) {
-						metadata[comment.field] = comment.value;
-					}
-				} catch (e) {
-					console.warn('Error parsing vorbis comment', e);
+			// Get the contents of this block, plus enough to read the next block's
+			// header if necessary.
+			page.getMore(page.viewOffset + page.index, length + 4, function(block, error) {
+				if (error) {
+					errorCallback(error);
+					return;
 				}
-			}
-		}
-
-		/*
-		* Read a single comment field.
-		*
-		* @param {BlobView} page The audio file being parsed.
-		*/
-		function readComment(page) {
-			var comment_length = page.readUnsignedInt(true);
-			var comment = page.readUTF8Text(comment_length);
-			var equal = comment.indexOf('=');
-			if (equal === -1) {
-				throw new Error('missing delimiter in comment');
-			}
+				
+				switch (type) {
+					case 4:
+						var vendor_string_length = block.readUnsignedInt(true);
+						/*  skip vendor string  */ block.advance(vendor_string_length);
+						var num_comments         = block.readUnsignedInt(true);
+				
+						for (; num_comments > 0; num_comments--) {
+					
+							var comment_length = block.readUnsignedInt(true),
+								comment        = block.readUTF8Text(comment_length),
+								equal          = comment.indexOf('='),
+								comment_tag    = comment.substring(0, equal).toUpperCase().replace(' ', '');
+					
+							if (comment_tag in VORBIS_COMMENTS) {
+								metadata[VORBIS_COMMENTS[comment_tag]] = comment.substring(equal + 1);
+							}
+						}
+						Has['VORBIS_COMMENT'] = true;
+						break;
+					case 6:
+						metadata['picture'] = MDPBlockReader(block);
+						Has['PICTURE'] = true;
+						break;
+					default:
+						block.advance(length - block.index);
+				}
 			
-			var fieldname = comment.substring(0, equal).toUpperCase().replace(' ', '');
-			var propname = VORBIS_COMMENTS[fieldname];
-			if (propname) { // Do we care about this field?
-				var value = comment.substring(equal + 1);
-				return {
-					field: propname,
-					value: value
-				};
-			}
-			return null;
+				if (Has['VORBIS_COMMENT'] && Has['PICTURE'] || last) {
+					metadataCallback(metadata);
+				} else {
+					readFLACPages(block);
+				}
+			});
 		}
 	}
-
-
 
 	// MP4 files use 'ftyp' to identify the type of encoding.
 	// 'ftyp' information
@@ -1073,44 +992,37 @@ function parse_audio_metadata (blob, metadataCallback, errorCallback) {
 		return taBytes;
 	}
 	
-	function MDPBlockParser(mbp_blob) {
+	function MDPBlockReader(page) {
 	// Source of the structure:
 	// https://xiph.org/flac/format.html#metadata_block_picture
 	// http://flac.sourceforge.net/format.html#metadata_block_picture
 	//
-		BlobView.get(mbp_blob, 0, mbp_blob.size, function (page, error) {
-			if (error) {
-				errorCallback(error);
-				return;
-			}
+		var mimeL, mime, descL, imageL, image, Props = {}, pictute_blob;
+		// ID3v2_APIC = { 0: Other, 1: 32x32 pixels 'file icon' (PNG only), 2: Other file icon, 3: Cover (front), 4: Cover (back), 5: Leaflet page,
+		// 6: Media (e.g. label side of CD), 7: Lead artist/lead performer/soloist, 8: Artist/performer, 9: Conductor, 10: Band/Orchestra,
+		// 11: Composer, 12: Lyricist/text writer, 13: Recording Location, 14: During recording, 15: During performance,
+		// 16: Movie/video screen capture, 17: A bright coloured fish, 18: Illustration, 19: Band/artist logotype, 20: Publisher/Studio logotype }
+		Props.APIC   = page.readUnsignedInt()
 		
-			var mimeL, mime, descL, imageL, image, Props = {};
-			// ID3v2_APIC = { 0: Other, 1: 32x32 pixels 'file icon' (PNG only), 2: Other file icon, 3: Cover (front), 4: Cover (back), 5: Leaflet page,
-			// 6: Media (e.g. label side of CD), 7: Lead artist/lead performer/soloist, 8: Artist/performer, 9: Conductor, 10: Band/Orchestra,
-			// 11: Composer, 12: Lyricist/text writer, 13: Recording Location, 14: During recording, 15: During performance,
-			// 16: Movie/video screen capture, 17: A bright coloured fish, 18: Illustration, 19: Band/artist logotype, 20: Publisher/Studio logotype }
-			Props.APIC   = page.readUnsignedInt()
+		mimeL        = page.readUnsignedInt()  // MIME Type section size - [image/png 0x09, image/jpeg 0x12]
+		mime         = page.readASCIIText(mimeL) // MIME Type section
 		
-			mimeL        = page.readUnsignedInt()    // MIME Type section size - [image/png 0x09, image/jpeg 0x12]
-			mime         = page.readASCIIText(mimeL) // MIME Type section
+		descL        = page.readUnsignedInt()  // Description section size
+		Props.name   = page.readASCIIText(descL) // Description section (it's somthing like comment)
+		Props.width  = page.readUnsignedInt()  // image size width
+		Props.height = page.readUnsignedInt()  // image size height
+		Props.depth  = page.readUnsignedInt()  // image color depth [8, 16, 24, 32]
+		Props.index  = page.readUnsignedInt()  // maybe color profile, i dont know
+		imageL       = page.readUnsignedInt()  // image section size
+		image        = page.readUnsignedByteArray(imageL) // image section
 		
-			descL        = page.readUnsignedInt()    // Description section size
-			Props.name   = page.readASCIIText(descL) // Description section (it's somthing like comment)
-			Props.width  = page.readUnsignedInt()    // image size width
-			Props.height = page.readUnsignedInt()    // image size height
-			Props.depth  = page.readUnsignedInt()    // image color depth [8, 16, 24, 32]
-			Props.index  = page.readUnsignedInt()    // maybe color profile, i dont know
-			imageL       = page.readUnsignedInt()    // image section size
-			image        = page.readUnsignedByteArray(imageL) // image section
+		pictute_blob = new Blob([image], {type: mime});
 		
-			metadata[IMAGE] = new Blob([image], {type: mime});
+		for (var key in Props) {
+			pictute_blob[key] = Props[key]
+		}
 		
-			for (var key in Props) {
-				metadata[IMAGE][key] = Props[key]
-			}
-		
-			metadataCallback(metadata);
-		})
+		return pictute_blob;
 	}
 }
 
